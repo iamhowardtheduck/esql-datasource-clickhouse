@@ -1,0 +1,16 @@
+<!-- config.d/10-server.xml
+     Listen on all interfaces inside the container (the compose port mapping is
+     what actually exposes it to the LAN), and keep ClickHouse's own memory
+     accounting inside the container cgroup limit so it degrades gracefully
+     instead of getting OOM-killed next to the frozen node. -->
+<clickhouse>
+    <listen_host>0.0.0.0</listen_host>
+
+    <!-- Use at most 80% of the cgroup limit (mem_limit in compose). -->
+    <max_server_memory_usage_to_ram_ratio>0.8</max_server_memory_usage_to_ram_ratio>
+
+    <!-- Modest mark/uncompressed caches; this box's page cache belongs to the
+         frozen tier's searchable-snapshot cache first. -->
+    <mark_cache_size>536870912</mark_cache_size>
+    <uncompressed_cache_size>536870912</uncompressed_cache_size>
+</clickhouse>

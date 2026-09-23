@@ -1,0 +1,39 @@
+/*
+ * ClickHouse connector for ES|QL Data Federation.
+ * Modeled on x-pack/plugin/esql-datasource-grpc/build.gradle @ v9.5.4.
+ *
+ * Drop this module at: x-pack/plugin/esql-datasource-clickhouse/
+ * in an elastic/elasticsearch checkout at tag v9.5.4, then build with:
+ *   ./gradlew :x-pack:plugin:esql-datasource-clickhouse:bundlePlugin
+ */
+
+apply plugin: 'elasticsearch.internal-es-plugin'
+
+esplugin {
+  name = 'esql-datasource-clickhouse'
+  description = 'ClickHouse connector support for ESQL external data sources (HTTP ArrowStream transport)'
+  classname = 'org.elasticsearch.xpack.esql.datasource.clickhouse.ClickHouseDataSourcePlugin'
+  extendedPlugins = ['x-pack-esql']
+}
+
+base {
+  archivesName = 'esql-datasource-clickhouse'
+}
+
+dependencies {
+  compileOnly project(path: xpackModule('esql'))
+  compileOnly project(path: xpackModule('esql-core'))
+  compileOnly project(path: xpackModule('core'))
+  compileOnly project(':server')
+  compileOnly project(xpackModule('esql:compute'))
+
+  // Arrow vector/memory/ipc — same lib the core esql plugin and the grpc
+  // connector use (provides ArrowStreamReader and the allocator types that
+  // BlockFactory.arrowAllocator() hands out).
+  implementation project(":libs:arrow")
+}
+
+tasks.named("test").configure {
+  // Arrow's unsafe memory allocator requires access to java.nio internals
+  jvmArgs('--add-opens=java.base/java.nio=ALL-UNNAMED')
+}

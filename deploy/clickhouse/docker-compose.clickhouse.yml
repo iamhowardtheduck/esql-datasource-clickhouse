@@ -1,0 +1,44 @@
+# ClickHouse on the frozen-node host (Ubuntu 24.04)
+# Runs alongside your existing frozen-node compose as its own stack:
+#   docker compose -f docker-compose.clickhouse.yml up -d
+#
+# Publishing 8123 on the host means the ES containers on the *other* physical
+# host reach it as  clickhouse://<frozen-host-ip-or-dns>:8123/...  — no shared
+# Docker network needed across hosts.
+
+name: clickhouse
+
+services:
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.8   # LTS; pin and upgrade deliberately
+    container_name: clickhouse
+    restart: unless-stopped
+    ports:
+      - "8123:8123"   # HTTP interface — what the esql-datasource-clickhouse connector uses
+      - "9000:9000"   # native TCP — clickhouse-client, optional but handy
+    volumes:
+      - ./config.d:/etc/clickhouse-server/config.d:ro
+      - ./users.d:/etc/clickhouse-server/users.d:ro
+      - clickhouse-data:/var/lib/clickhouse
+      - clickhouse-logs:/var/log/clickhouse-server
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    # Keep ClickHouse from starving the frozen ES node. The frozen tier leans on
+    # the shared-cache mount and page cache, so cap ClickHouse hard and size
+    # mem_limit to what the host can actually spare. Adjust to your RAM.
+    mem_limit: 8g
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8123/ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+
+    environment:
+      CLICKHOUSE_SKIP_USER_SETUP: "1"
+
+volumes:
+  clickhouse-data:
+  clickhouse-logs:
+

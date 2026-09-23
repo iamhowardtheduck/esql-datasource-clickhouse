@@ -1,0 +1,14 @@
+<clickhouse>
+    <users>
+        <default replace="replace">
+            <password_sha256_hex>REPLACE_WITH_SHA256_HEX</password_sha256_hex>
+            <profile>default</profile>
+            <quota>default</quota>
+            <networks>
+                <ip>127.0.0.1</ip>
+                <ip>::1</ip>
+            </networks>
+            <access_management>1</access_management>
+        </default>
+    </users>
+</clickhouse>

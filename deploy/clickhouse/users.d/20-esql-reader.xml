@@ -1,0 +1,31 @@
+<!-- users.d/20-esql-reader.xml
+     Dedicated read-only account the esql-datasource-clickhouse connector uses.
+     readonly=2 allows SELECT plus per-query settings changes — required, because
+     the connector sets output_format_arrow_string_as_string / max_block_size etc.
+     as URL parameters on every query (readonly=1 would reject those). -->
+<clickhouse>
+    <users>
+        <esql_reader>
+            <!-- Generate with: echo -n 'YOUR-PASSWORD' | sha256sum -->
+            <password_sha256_hex>REPLACE_WITH_SHA256_HEX</password_sha256_hex>
+            <profile>esql_reader_profile</profile>
+            <quota>default</quota>
+            <networks>
+                <!-- Tighten to your ES hosts' subnet, e.g. <ip>10.0.0.0/24</ip> -->
+                <ip>::/0</ip>
+            </networks>
+        </esql_reader>
+    </users>
+
+    <profiles>
+        <esql_reader_profile>
+            <readonly>2</readonly>
+            <max_memory_usage>2000000000</max_memory_usage>       <!-- 2 GB per query -->
+            <max_execution_time>300</max_execution_time>          <!-- matches connector request_timeout_ms default -->
+            <max_result_rows>0</max_result_rows>                  <!-- ES|QL applies its own LIMIT pushdown -->
+            <output_format_arrow_string_as_string>1</output_format_arrow_string_as_string>
+            <output_format_arrow_low_cardinality_as_dictionary>0</output_format_arrow_low_cardinality_as_dictionary>
+            <output_format_arrow_compression_method>none</output_format_arrow_compression_method>
+        </esql_reader_profile>
+    </profiles>
+</clickhouse>
