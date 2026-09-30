@@ -1,106 +1,160 @@
 # esql-datasource-clickhouse
 
-A custom **ES|QL Data Federation connector** that lets Elasticsearch query **ClickHouse** directly with ES|QL — no ETL, no JDBC, no data duplication.
+Query **ClickHouse** — and, through it, **Apache Iceberg** — directly from Elasticsearch with **ES|QL**. No ETL, no JDBC, no data duplication.
 
 ```esql
-FROM my_es_index
-| WHERE user.id IN (FROM clickhouse_events | WHERE status == 500 | KEEP user_id)
-| LIMIT 100
+FROM clickhouse_orders
+| WHERE warehouse_code IN (FROM iceberg_shipments | WHERE status == "lost" | KEEP warehouse_code)
+| STATS at_risk_revenue = SUM(order_price) BY warehouse_code
+| SORT at_risk_revenue DESC
 ```
 
-One statement, two databases. Add a CCS remote and it's three data planes (Elastic Cloud + on-prem Elasticsearch + ClickHouse) in a single query.
+Orders in ClickHouse, shipments in an Iceberg table on S3, joined in one ES|QL statement — coordinated by Elasticsearch. Add cross-cluster search and a single query spans **five data planes**: local indices, Elastic Cloud, S3 objects, ClickHouse tables, and an Iceberg lakehouse.
 
-Built against **Elasticsearch v9.5.4** using the ES|QL Data Federation SPI (`x-pack/plugin/esql/.../datasources/spi`), modeled on the in-tree Arrow Flight connector (`esql-datasource-grpc`).
+Built on the ES|QL **Data Federation** framework (experimental in 9.5) using its connector SPI, modeled on the in-tree Arrow Flight connector. Targets **Elasticsearch 9.5.4** exactly; rebuild per version.
+
+> Community project — not a supported Elastic product.
 
 ## How it works
 
-- Speaks ClickHouse's **native HTTP interface** (port 8123; 8443 with `secure=true`) using `FORMAT ArrowStream`
-- Arrow record batches are converted to ES|QL compute Blocks via the same `ArrowToEsql` machinery the Flight connector uses — **columnar end-to-end, no row-at-a-time conversion**
-- Pushes down **column projection and LIMIT** (9.5.4 does not push filters to external datasets)
-- Per-query ClickHouse settings ride as URL parameters; identifiers are validated (`^[A-Za-z_][A-Za-z0-9_]*$`) and back-quoted — no SQL smuggling via dataset definitions
-- Cancellation: best-effort `KILL QUERY ... ASYNC` by per-query `query_id` + stream close
-- URI form: `clickhouse://host[:port]/database/table` (schemes `clickhouse`, `ch`)
+- Speaks ClickHouse's native **HTTP interface** (8123; 8443 with `secure=true`) using `FORMAT ArrowStream`
+- Arrow record batches convert straight into ES|QL compute blocks — **columnar end-to-end**
+- **Column projection and LIMIT push down** to ClickHouse (filters do not, in 9.5.4 — keep a LIMIT or aggregate)
+- Identifiers are validated (`^[A-Za-z_][A-Za-z0-9_]*$`) and back-quoted; per-query settings ride as URL parameters
+- Best-effort cancellation via `KILL QUERY ... ASYNC` keyed on a per-query `query_id`
+- URI form: `clickhouse://host[:port]/database/table_or_view`
+- **Iceberg**: ClickHouse's `iceberg()` table function reads Iceberg tables on S3; wrap it in a view and the connector federates the lakehouse with zero plugin changes (read-only; v2 delete-file support in CH 24.8 is partial — append-only tables are the safe zone)
 
-## Repository layout
+## Install
 
-```
-plugin/               ES plugin module source (drop into x-pack/plugin/ of a v9.5.4 checkout)
-deploy/es-image/      Dockerfile: stock ES 9.5.4 + this plugin baked in
-deploy/clickhouse/    ClickHouse compose + config.d/ + users.d/ (read-only esql_reader account)
-docs/                 This file and FINDINGS
-```
+### Option A — Elastic Cloud Hosted (Extensions)
 
-## Build
+1. Use the release asset `esql-ch-cloud-9.5.4.zip` (the **flat** zip: `plugin-descriptor.properties` and the jar at the zip **root** — Cloud's validator does not descend into a wrapping folder).
+2. Cloud console → **Features → Extensions → Upload extension**: type *Elasticsearch plugin*, version `9.5.4`.
+3. Deployment → Edit → tick the extension under **Manage plugins and settings**.
+4. Add to Elasticsearch user settings, in the same plan: `esql.federation.enabled: true`
+5. Apply the plan (rolling restart), then `GET /_cat/plugins?v` — the plugin must show on **every** node.
 
-The plugin must be built **in-tree** (it compiles against internal SPI):
+Deployment version must equal the plugin version exactly. Serverless does not take custom plugins.
 
-```bash
-git clone --depth 1 --branch v9.5.4 https://github.com/elastic/elasticsearch.git
-cp -r plugin elasticsearch/x-pack/plugin/esql-datasource-clickhouse
-cd elasticsearch
-./gradlew :x-pack:plugin:esql-datasource-clickhouse:bundlePlugin
-# → x-pack/plugin/esql-datasource-clickhouse/build/distributions/esql-datasource-clickhouse-9.5.4-SNAPSHOT.zip
-```
+### Option B — Self-managed Docker (bake the image)
 
-Or grab the zip from Releases.
-
-## Deploy
-
-**1. Bake the plugin into the image** — the ES plugins directory is container-local (not a volume), so runtime installs evaporate on recreate:
+The ES plugins directory is container-local, so runtime installs evaporate on recreate — **bake the plugin into the image**:
 
 ```bash
-cp esql-datasource-clickhouse-*.zip deploy/es-image/esql-datasource-clickhouse-9.5.4.zip
+cp esql-datasource-clickhouse-9.5.4.zip deploy/es-image/
 docker build -t elasticsearch-esql-clickhouse:9.5.4 deploy/es-image
 ```
 
-**2. Run it on EVERY node** and set on every node (frozen tier included):
+Run that image on **every node** (frozen tier included) with:
 
 ```yaml
 - esql.federation.enabled=true
 ```
 
-The gate is per-node: a data node without it **rejects federated work shipped to it**, producing intermittent failures depending on which node a plan touches. Roll nodes with `docker compose up -d --force-recreate <node>` — plain `restart` reuses the old image.
+The gate is per-node: a node without it rejects federated work shipped to it, causing intermittent failures. Roll nodes with `docker compose up -d --force-recreate <node>` — plain `restart` reuses the old image.
 
-**3. ClickHouse** (see `deploy/clickhouse/`): set real password hashes (`echo -n 'pw' | sha256sum`) in `users.d/*.xml`. The `esql_reader` account is `readonly=2` deliberately — the connector sends settings as URL params, which `readonly=1` rejects.
+### Option C — Build from source (in-tree)
+
+The plugin compiles against internal SPI, so it builds inside an Elasticsearch checkout:
+
+```bash
+git clone --depth 1 --branch v9.5.4 https://github.com/elastic/elasticsearch.git
+cp -r plugin elasticsearch/x-pack/plugin/esql-datasource-clickhouse
+cd elasticsearch
+./gradlew :x-pack:plugin:esql-datasource-clickhouse:bundlePlugin          # snapshot build
+# release-versioned build (Cloud needs elasticsearch.version=9.5.4, no -SNAPSHOT):
+./gradlew :x-pack:plugin:esql-datasource-clickhouse:bundlePlugin \
+  -Dbuild.snapshot=false \
+  -Dlicense.key=$PWD/x-pack/license-tools/src/test/resources/public.key
+```
+
+Output: `x-pack/plugin/esql-datasource-clickhouse/build/distributions/`. For Cloud, repackage flat (unzip, then re-zip from inside the folder so the descriptor sits at the root).
+
+## ClickHouse setup
+
+See `deploy/clickhouse/`. The essentials:
+
+- A dedicated read-only account with **`readonly=2`** — the connector sends settings as URL parameters, which `readonly=1` rejects.
+- **`output_format_arrow_compression_method=none`** in that account's profile — ClickHouse compresses Arrow output with LZ4_FRAME by default, which Arrow-Java can't read without an optional module. (Schema probes pass either way; the first query with rows fails without this.)
+- Set real password hashes: `echo -n 'pw' | sha256sum` into `users.d/*.xml`.
+- **S3-compatible stores that enforce SigV4 scope** (Garage, some MinIO configs): ClickHouse signs S3/Iceberg requests as `us-east-1` by default. Configure the region per endpoint or reads fail with `400 Authorization header malformed, unexpected scope`:
+
+```xml
+<clickhouse><s3><garage>
+  <endpoint>http://YOUR-S3-HOST:3900/</endpoint>
+  <region>garage</region>
+</garage></s3></clickhouse>
+```
+
+### Iceberg via ClickHouse (optional)
+
+```sql
+CREATE VIEW analytics.iceberg_shipments_esql AS
+SELECT shipment_id, warehouse_code, carrier, status,
+       toFloat64(weight_kg) AS weight_kg,
+       toDateTime64(ship_ts, 3) AS ship_ts
+FROM iceberg('http://YOUR-S3-HOST:3900/BUCKET/namespace/table', 'ACCESS_KEY', 'SECRET_KEY');
+```
+
+Register the view like any table. Credentials live in the view DDL, so the read-only account never holds them.
 
 ## Register & query
 
 ```
-PUT /_query/data_source/ch_prod
+PUT /_query/data_source/clickhouse-prod
 { "type": "clickhouse", "settings": {} }
 
-PUT /_query/dataset/clickhouse_events
-{ "data_source": "ch_prod",
-  "resource": "clickhouse://<ch-host>:8123/analytics/events",
+PUT /_query/dataset/clickhouse_orders
+{ "data_source": "clickhouse-prod",
+  "resource": "clickhouse://ch-host:8123/analytics/orders_esql",
   "settings": { "username": "esql_reader", "password": "<password>" } }
 
 POST /_query
-{ "query": "FROM clickhouse_events | STATS hits=COUNT(*) BY path, status | SORT hits DESC" }
+{ "query": "FROM clickhouse_orders | STATS revenue = SUM(order_price) BY warehouse_code | SORT revenue DESC" }
 ```
 
-**Credentials go on the dataset, not the data source** — see Finding 2. Dataset PUTs are lazy (no probe); the first schema resolution happens at query time.
+- **Credentials go on the dataset, not the data source** — see Finding 2.
+- Dataset PUTs are lazy: the first ClickHouse contact happens at query time, so registration errors surface on first query. The true cause of any `Failed to resolve metadata` is one `grep -A8` away in the coordinating node's log.
+- Data source *names* are free; the *type* must be `clickhouse`. Multiple logical sources (e.g. one named `iceberg`) can share the type.
+- **Decimal and Date columns**: not yet in the Arrow type mapping — expose a view casting `toFloat64(...)` / `toDateTime64(..., 3)` and register the view (v0.2 fixes this natively).
 
 Config keys: `endpoint`, `database`, `table`, `username`, `password`, `secure`, `connect_timeout_ms` (5000), `request_timeout_ms` (300000).
 
-## Findings (the hard-won part)
+## Findings
 
-Discovered building and debugging this against a live 9.5.4 cluster — none are documented upstream:
+Discovered building and debugging this against live clusters; none are documented upstream:
 
-1. **CRUD registration requires a `DataSourceValidator`.** `PUT /_query/data_source` resolves `type` against `DataSourcePlugin#datasourceValidators()`; without one you get `unknown data source type [...]`. The in-tree Flight connector ships none and misleads — it is never registered via REST in release builds.
-2. **The `_datasource` envelope reaches connectors undecrypted (9.5.4).** Secrets stored `secret=true` arrive at connectors as `EncryptedData` carriers: `DataSourceCredentials.decryptInPlace` is top-level-only and only `StorageProviderRegistry` flattens+decrypts the envelope — the connector path doesn't. Workaround: pass credentials as **dataset-level** settings (top-level, plaintext plumbing), or store them non-secret. Framework gap worth fixing upstream.
-3. **JDK `HttpClient` defaults to HTTP/2 and sends an h2c upgrade** (`Upgrade: h2c`, `HTTP2-Settings`) on plaintext connections; ClickHouse mishandles it into `AUTHENTICATION_FAILED`. The client is pinned to `HTTP_1_1`.
-4. **ClickHouse compresses Arrow output with LZ4_FRAME by default**; Arrow-Java needs the optional `arrow-compression` module to read it. Set `output_format_arrow_compression_method=none` (in the profile and/or as a connector param) — schema probes (`LIMIT 0`) succeed regardless, so this only surfaces on the first query with rows.
-5. **The connector's config map includes internal keys** (`_datasource` envelope) at query time — strict key validation must flatten the envelope and ignore `_`-prefixed keys (`ClickHouseTarget.effective`).
+1. **CRUD registration requires a `DataSourceValidator`.** `PUT /_query/data_source` resolves `type` against `DataSourcePlugin#datasourceValidators()`; without one: `unknown data source type`. The in-tree Flight exemplar ships none and misleads.
+2. **The `_datasource` secrets envelope reaches connectors undecrypted (9.5.4).** Only the storage-provider path flattens and decrypts it; the connector path doesn't. Workaround: dataset-level credentials (top-level plumbing) stored non-secret. Framework gap worth fixing upstream.
+3. **JDK `HttpClient` defaults to an HTTP/2 h2c upgrade** on plaintext, which ClickHouse turns into `AUTHENTICATION_FAILED`. The client is pinned to HTTP/1.1.
+4. **ClickHouse compresses Arrow output with LZ4_FRAME by default**; Arrow-Java needs the optional `arrow-compression` module. Fixed server-side via the profile setting above.
+5. **`readonly=2`, not `1`** — the connector's per-query settings ride as URL parameters.
+6. **Arrow `Decimal(p,s,128)` and `Date` are unmapped** in this version — casting views until the mapping extension lands.
+7. **SigV4-strict S3 stores reject ClickHouse's default `us-east-1` signing scope** with an opaque 400; per-endpoint `<region>` config fixes it. The `iceberg()` metadata phase retries through the failure while the data phase fails loudly — the symptom points everywhere except the cause.
 
-Operational lessons: image-bake plugins; `--force-recreate` is the only honest roll; container keystores are ephemeral — secure settings (including `cluster.state.encryption.password.*`, which encrypted data-source secrets depend on) belong in a keystore-populating command wrapper or they die with the container.
+Operational lessons: image-bake plugins; `--force-recreate` is the only honest roll; container keystores are ephemeral — secure settings (including `cluster.state.encryption.password.*`) belong in a keystore-populating command wrapper; `esql.federation.enabled` on every node; Cloud extension zips must be flat.
 
 ## Limitations
 
-- 9.5.4: filters are **not** pushed down to external datasets — only projection and LIMIT; keep tables or LIMITs reasonable
-- `STOP` returns partial results; hard cancel fails the query (connector still fires `KILL QUERY` in ClickHouse)
-- Single split (no parallel scan) in this version
-- Passwords for this connector are effectively plaintext in cluster state (Finding 2) — use a dedicated read-only ClickHouse account with tight `<networks>` and per-query limits, as shipped in `deploy/clickhouse/`
+- Filters are not pushed down (9.5.4) — only projection and LIMIT
+- Single split; no parallel scan in this version
+- `STOP` returns partial results; hard cancel fails the query (a `KILL QUERY` still fires in ClickHouse)
+- Credentials are effectively plaintext in cluster state (Finding 2) — use a dedicated read-only ClickHouse account with tight `<networks>` and per-query limits, as shipped
+- No `ca_cert` / custom truststore keys yet: `secure=true` trusts the JVM default truststore only (public CAs)
+
+## Roadmap (v0.2)
+
+- Native Decimal/Date Arrow mapping (retire the casting views)
+- Filter pushdown
+- TLS trust configuration (`ca_cert`, hostname verification) + operator endpoint-allowlist parity with the S3 connector (FIPS groundwork)
+- ClickHouse as a first-class type in Kibana's Data Federation UI
+- Longer term: catalog-native `esql-datasource-iceberg` with SplitProvider parallel scans
+
+## Credits
+
+Built with [Sourcerer](https://github.com/elastic/sourcerer) — repo-scale code search across the Elasticsearch and Kibana trees mapped the undocumented Data Federation SPI, the connector registration path, and the Kibana UI internals.
 
 ## License / status
 
-Lab-grade proof of concept against internal SPI — expect the SPI to change between minor versions; rebuild in-tree per version. Not an official Elastic product.
+Lab-grade proof of concept against internal SPI; expect the SPI to move between minors — rebuild in-tree per version. Not an official Elastic product.
